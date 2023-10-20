@@ -19,10 +19,11 @@ use enum_as_inner::EnumAsInner;
 use once_cell::sync::Lazy;
 use thiserror::Error;
 
-use crate::op::Header;
+use crate::op::{Header, Query};
 
 #[cfg(feature = "dnssec")]
 use crate::rr::dnssec::rdata::tsig::TsigAlgorithm;
+use crate::rr::dnssec::Proof;
 use crate::rr::{Name, RecordType};
 use crate::serialize::binary::DecodeError;
 
@@ -92,6 +93,15 @@ pub enum ProtoErrorKind {
         label: usize,
         /// Start of the other label
         other: usize,
+    },
+
+    /// No Records and there is a corresponding DNSSEC Proof for NSEC
+    #[error("DNSSEC Negative Record Response for {query}, {proof}")]
+    Nsec {
+        /// Query for which the NSEC was returned
+        query: Query,
+        /// DNSSEC proof of the record
+        proof: Proof,
     },
 
     /// DNS protocol version doesn't have the expected version 3
@@ -454,6 +464,10 @@ impl Clone for ProtoErrorKind {
             Msg(ref msg) => Msg(msg.clone()),
             NoError => NoError,
             NotAllRecordsWritten { count } => NotAllRecordsWritten { count },
+            Nsec { ref query, proof } => Nsec {
+                query: query.clone(),
+                proof,
+            },
             RrsigsNotPresent {
                 ref name,
                 ref record_type,
