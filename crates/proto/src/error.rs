@@ -22,8 +22,7 @@ use thiserror::Error;
 use crate::op::{Header, Query};
 
 #[cfg(feature = "dnssec")]
-use crate::rr::dnssec::rdata::tsig::TsigAlgorithm;
-use crate::rr::dnssec::Proof;
+use crate::rr::dnssec::{rdata::tsig::TsigAlgorithm, Proof};
 use crate::rr::{Name, RecordType};
 use crate::serialize::binary::DecodeError;
 
@@ -96,6 +95,7 @@ pub enum ProtoErrorKind {
     },
 
     /// No Records and there is a corresponding DNSSEC Proof for NSEC
+    #[cfg(feature = "dnssec")]
     #[error("DNSSEC Negative Record Response for {query}, {proof}")]
     Nsec {
         /// Query for which the NSEC was returned
@@ -464,6 +464,7 @@ impl Clone for ProtoErrorKind {
             Msg(ref msg) => Msg(msg.clone()),
             NoError => NoError,
             NotAllRecordsWritten { count } => NotAllRecordsWritten { count },
+            #[cfg(feature = "dnssec")]
             Nsec { ref query, proof } => Nsec {
                 query: query.clone(),
                 proof,
