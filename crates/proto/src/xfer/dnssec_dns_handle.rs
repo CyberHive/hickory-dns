@@ -33,6 +33,7 @@ use crate::{
 #[cfg(feature = "dnssec")]
 use crate::rr::dnssec::Verifier;
 
+// TODO: combine this with crate::rr::RecordSet?
 #[derive(Debug)]
 struct Rrset<R: RecordData = RData> {
     pub(crate) name: Name,
@@ -291,7 +292,7 @@ where
     }
 }
 
-/// this pulls all records returned in a Message response and returns a future which will
+/// This pulls all answers returned in a Message response and returns a future which will
 ///  validate all of them.
 #[allow(clippy::type_complexity)]
 async fn verify_rrsets<H, E>(
@@ -305,6 +306,8 @@ where
     E: From<ProtoError> + Error + Clone + Send + Unpin + 'static,
 {
     let mut rrset_types: HashSet<(Name, RecordType)> = HashSet::new();
+
+    // TODO: why isn't this also looking additionals?
     for rrset in message_result
         .answers()
         .iter()
@@ -352,12 +355,14 @@ where
             .cloned()
             .collect();
 
-        let rrsigs: Vec<Record<RRSIG>> = message_result
+        // RRSIGS are never modified after this point
+        let rrsigs: Vec<RRSIG> = message_result
             .answers()
             .iter()
             .chain(message_result.name_servers())
             .chain(message_result.additionals())
-            .filter_map(|rr| RecordRef::<RRSIG>::try_from(rr).ok())
+            .filter_map(|rr| rr.data())
+            .filter_map(|rrsig| RRSIG::try_borrow(rrsig))
             .map(|rr| rr.to_owned())
             .collect();
 
@@ -494,7 +499,7 @@ where
 async fn verify_rrset<H, E>(
     handle: DnssecDnsHandle<H>,
     rrset: Rrset,
-    rrsigs: Vec<Record<RRSIG>>,
+    rrsigs: Vec<RRSIG>,
     options: DnsRequestOptions,
 ) -> Result<Rrset, E>
 where
@@ -592,6 +597,13 @@ where
         .lookup(Query::query(rrset.name.clone(), RecordType::DS), options)
         .first_answer()
         .await?;
+
+    // if DS record query is NSEC then this is
+    Proof::Insecure;
+    // if DS record query is NXdomain or no records found then
+    Proof::Indeterminate;
+    // otherwise, if DS record is Proof::Secure, then continue
+
     let valid_keys = rrset
         .records
         .iter()
@@ -701,7 +713,7 @@ fn test_preserve() {
 async fn verify_default_rrset<H, E>(
     handle: &DnssecDnsHandle<H>,
     rrset: Rrset,
-    rrsigs: Vec<Record<RRSIG>>,
+    rrsigs: Vec<RRSIG>,
     options: DnsRequestOptions,
 ) -> Result<Rrset, E>
 where
@@ -719,7 +731,6 @@ where
     // Special case for self-signed DNSKEYS, validate with itself...
     if rrsigs
         .iter()
-        .filter_map(|rrsig| rrsig.data())
         .any(|rrsig| RecordType::DNSKEY == rrset.record_type && rrsig.signer_name() == &rrset.name)
     {
         // in this case it was looks like a self-signed key, first validate the signature
@@ -729,7 +740,6 @@ where
         return future::ready(
             rrsigs
                 .into_iter()
-                .filter_map(|rrsig| rrsig.into_data())
                 .filter_map(|sig| {
                     let rrset = Arc::clone(&rrset);
 
@@ -768,11 +778,11 @@ where
     //        dns over TLS will mitigate this.
     //  TODO: strip RRSIGS to accepted algorithms and make algorithms configurable.
     let verifications = rrsigs.into_iter()
-        .filter_map(|rrsig|rrsig.into_data())
         .map(|sig| {
             let rrset = Arc::clone(&rrset);
             let handle = handle.clone_with_context();
 
+            // TODO: Should this sig.signer_name should be confirmed to be in the same zone as the rrsigs and rrset?
             handle
                 .lookup(
                     Query::query(sig.signer_name().clone(), RecordType::DNSKEY),
@@ -796,6 +806,15 @@ where
                 )
         })
         .collect::<Vec<_>>();
+
+    // if there some were valid we have a
+    Proof::Secure;
+    // if there were No DNSKey records, and there is a valid NSSEC record for the DNSKey/DS/RRSIG records, then we have a
+    Proof::Insecure;
+    // if there were DNSKeys/DS/RRSIG, but none were verified, we have a Bogus situation
+    Proof::Bogus;
+    // if there were no DNSKeys and there are no NSSEC records for the DNSKeys/DS/RRSIG records then we have a
+    Proof::Indeterminate;
 
     // if there are no available verifications, then we are in a failed state.
     if verifications.is_empty() {

@@ -19,7 +19,7 @@ use enum_as_inner::EnumAsInner;
 use once_cell::sync::Lazy;
 use thiserror::Error;
 
-use crate::op::{Header, Query};
+use crate::op::Header;
 
 #[cfg(feature = "dnssec")]
 use crate::rr::dnssec::{rdata::tsig::TsigAlgorithm, Proof};
@@ -99,7 +99,7 @@ pub enum ProtoErrorKind {
     #[error("DNSSEC Negative Record Response for {query}, {proof}")]
     Nsec {
         /// Query for which the NSEC was returned
-        query: Query,
+        query: crate::op::Query,
         /// DNSSEC proof of the record
         proof: Proof,
     },
