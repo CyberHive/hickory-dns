@@ -191,11 +191,17 @@ where
         if let OpCode::Query = request.op_code() {
             // This will panic on no queries, that is a very odd type of request, isn't it?
             // TODO: with mDNS there can be multiple queries
-            let query = request
-                .queries()
-                .first()
-                .cloned()
-                .expect("no queries in request");
+            let query = if let Some(query) = request.queries().first().cloned() {
+                query
+            } else {
+                return Box::pin(stream::once(future::err(Self::Error::from(
+                    ProtoError::from("no query in request"),
+                ))));
+            };
+
+            let query: Arc<Query> = Arc::new(query);
+            let query2: Arc<Query> = Arc::clone(&query);
+
             let handle: Self = self.clone_with_context();
 
             // TODO: cache response of the server about understood algorithms
@@ -223,10 +229,6 @@ where
 
             request.set_authentic_data(true);
             request.set_checking_disabled(false);
-            let dns_class = request
-                .queries()
-                .first()
-                .map_or(DNSClass::IN, Query::query_class);
             let options = *request.options();
 
             return Box::pin(
@@ -240,9 +242,17 @@ where
                             message_response.id(),
                             handle.trust_anchor.len(),
                         );
-                        verify_rrsets(handle.clone(), message_response, dns_class, options)
+                        verify_response(
+                            handle.clone(),
+                            Arc::clone(&query),
+                            message_response,
+                            options,
+                        )
                     })
                     .and_then(move |verified_message| {
+                        // Query should be unowned at this point
+                        let query = Arc::clone(&query2);
+
                         // at this point all of the message is verified.
                         //  This is where NSEC (and possibly NSEC3) validation occurs
                         // As of now, only NSEC is supported.
@@ -268,12 +278,13 @@ where
                                 .filter(|rr| is_dnssec(rr, RecordType::NSEC))
                                 .collect::<Vec<_>>();
 
-                            let nsec_proof = verify_nsec(&query, soa_name, nsecs.as_slice());
+                            let nsec_proof =
+                                verify_nsec(Arc::clone(&query), soa_name, nsecs.as_slice());
                             if !nsec_proof.is_secure() {
                                 // TODO change this to remove the NSECs, like we do for the others?
                                 return future::err(Self::Error::from(ProtoError::from(
                                     ProtoErrorKind::Nsec {
-                                        query: query.clone(),
+                                        query: (*query).clone(),
                                         proof: nsec_proof,
                                     },
                                 )));
@@ -289,26 +300,50 @@ where
     }
 }
 
-/// This pulls all answers returned in a Message response and returns a future which will
-///  validate all of them.
+/// Extracts the different sections of a message and verifies the RRSIGs
 #[allow(clippy::type_complexity)]
-async fn verify_rrsets<H, E>(
+async fn verify_response<H, E>(
     handle: DnssecDnsHandle<H>,
-    message_result: DnsResponse,
-    dns_class: DNSClass,
+    query: Arc<Query>,
+    mut message: DnsResponse,
     options: DnsRequestOptions,
 ) -> Result<DnsResponse, E>
 where
     H: DnsHandle<Error = E> + Sync + Unpin,
     E: From<ProtoError> + Error + Clone + Send + Unpin + 'static,
 {
+    let answers = message.take_answers();
+    let nameservers = message.take_name_servers();
+    let additionals = message.take_additionals();
+
+    let answers = verify_rrsets(handle.clone(), &query, answers, options).await?;
+    let nameservers = verify_rrsets(handle.clone(), &query, nameservers, options).await?;
+    let additionals = verify_rrsets(handle.clone(), &query, additionals, options).await?;
+
+    message.insert_answers(answers);
+    message.insert_name_servers(nameservers);
+    message.insert_additionals(additionals);
+
+    Ok(message)
+}
+
+/// This pulls all answers returned in a Message response and returns a future which will
+///  validate all of them.
+#[allow(clippy::type_complexity)]
+async fn verify_rrsets<H, E>(
+    handle: DnssecDnsHandle<H>,
+    query: &Query,
+    records: Vec<Record>,
+    options: DnsRequestOptions,
+) -> Result<Vec<Record>, E>
+where
+    H: DnsHandle<Error = E> + Sync + Unpin,
+    E: From<ProtoError> + Error + Clone + Send + Unpin + 'static,
+{
     let mut rrset_types: HashSet<(Name, RecordType)> = HashSet::new();
 
-    for rrset in message_result
-        .answers()
+    for rrset in records
         .iter()
-        .chain(message_result.name_servers())
-        .chain(message_result.additionals())
         .filter(|rr| {
             !is_dnssec(rr, RecordType::RRSIG) &&
                              // if we are at a depth greater than 1, we are only interested in proving evaluation chains
@@ -324,41 +359,24 @@ where
         rrset_types.insert(rrset);
     }
 
-    // there was no data returned in that message
+    // there were no records to verify
     if rrset_types.is_empty() {
-        // TODO: stop cloning message here, take all the answers, etc, from above.
-        let mut message_result = message_result.into_message();
-
-        // there were no returned results, double check by dropping all the results
-        message_result.take_answers();
-        message_result.take_name_servers();
-        message_result.take_additionals();
-
-        return Err(E::from(ProtoError::from(ProtoErrorKind::Message(
-            "no results to verify",
-        ))));
+        return Ok(records);
     }
 
     // collect all the rrsets to verify
     // TODO: is there a way to get rid of this clone() safely?
     let mut rrsets_to_verify = Vec::with_capacity(rrset_types.len());
     for (name, record_type) in rrset_types {
-        // TODO: should we evaluate the different sections (answers and name_servers) separately?
-        let records: Vec<Record> = message_result
-            .answers()
+        let rrs_to_verify: Vec<Record> = records
             .iter()
-            .chain(message_result.name_servers())
-            .chain(message_result.additionals())
             .filter(|rr| rr.record_type() == record_type && rr.name() == &name)
             .cloned()
             .collect();
 
         // RRSIGS are never modified after this point
-        let rrsigs: Vec<RRSIG> = message_result
-            .answers()
+        let rrsigs: Vec<RRSIG> = records
             .iter()
-            .chain(message_result.name_servers())
-            .chain(message_result.additionals())
             .filter_map(|rr| rr.data())
             .filter_map(|rrsig| RRSIG::try_borrow(rrsig))
             .map(|rr| rr.to_owned())
@@ -369,8 +387,8 @@ where
         let rrset = Rrset {
             name,
             record_type,
-            record_class: dns_class,
-            records,
+            record_class: query.query_class(),
+            records: rrs_to_verify,
         };
 
         // TODO: support non-IN classes?
@@ -385,7 +403,7 @@ where
     }
 
     // spawn a select_all over this vec, these are the individual RRSet validators
-    verify_all_rrsets(message_result, rrsets_to_verify).await
+    verify_all_rrsets(query, records, rrsets_to_verify).await
 }
 
 // TODO: is this method useful/necessary?
@@ -394,9 +412,10 @@ fn is_dnssec<D: RecordData>(rr: &Record<D>, dnssec_type: RecordType) -> bool {
 }
 
 async fn verify_all_rrsets<F, E>(
-    message_result: DnsResponse,
+    query: &Query,
+    records: Vec<Record>,
     rrsets: Vec<F>,
-) -> Result<DnsResponse, E>
+) -> Result<Vec<Record>, E>
 where
     F: Future<Output = Result<Rrset, E>> + Send + Unpin,
     E: From<ProtoError> + Error + Clone + Send + Unpin + 'static,
@@ -422,13 +441,6 @@ where
             // any error, is an error for all
             Err(e) => {
                 if tracing::enabled!(tracing::Level::DEBUG) {
-                    let mut query = message_result
-                        .queries()
-                        .iter()
-                        .map(|q| q.to_string())
-                        .fold(String::new(), |s, q| format!("{q},{s}"));
-
-                    query.truncate(query.len() - 1);
                     debug!("an rrset failed to verify ({}): {:?}", query, e);
                 }
 
@@ -451,51 +463,17 @@ where
         }
     }
 
-    // validated not none above...
-    let (mut message_result, message_buffer) = message_result.into_parts();
-
-    // take all the rrsets from the Message, filter down each set to the validated rrsets
-    // TODO: does the section in the message matter here?
-    //       we could probably end up with record_types in any section.
-    //       track the section in the rrset evaluation?
-    let answers = message_result
-        .take_answers()
-        .into_iter()
-        .chain(message_result.take_additionals().into_iter())
+    // take all the rrsets from the original set, filter down each set to the validated rrsets
+    let mut records = records;
+    records
+        .iter_mut()
         .filter(|record| verified_rrsets.contains(&(record.name().clone(), record.record_type())))
-        .map(|mut r| {
+        .for_each(|r| {
             r.set_proof(Proof::Secure);
-            r
-        })
-        .collect::<Vec<Record>>();
-
-    let name_servers = message_result
-        .take_name_servers()
-        .into_iter()
-        .filter(|record| verified_rrsets.contains(&(record.name().clone(), record.record_type())))
-        .map(|mut r| {
-            r.set_proof(Proof::Secure);
-            r
-        })
-        .collect::<Vec<Record>>();
-
-    let additionals = message_result
-        .take_additionals()
-        .into_iter()
-        .filter(|record| verified_rrsets.contains(&(record.name().clone(), record.record_type())))
-        .map(|mut r| {
-            r.set_proof(Proof::Secure);
-            r
-        })
-        .collect::<Vec<Record>>();
-
-    // add the filtered records back to the message
-    message_result.insert_answers(answers);
-    message_result.insert_name_servers(name_servers);
-    message_result.insert_additionals(additionals);
+        });
 
     // breaks out of the loop... and returns the filtered Message.
-    Ok(DnsResponse::new(message_result, message_buffer))
+    Ok(records)
 }
 
 /// Generic entrypoint to verify any RRSET against the provided signatures.
@@ -999,7 +977,7 @@ fn verify_rrset_with_dnskey(_: &DNSKEY, _: &RRSIG, _: &Rrset) -> ProtoResult<()>
 /// ```
 #[allow(clippy::blocks_in_if_conditions)]
 #[doc(hidden)]
-pub fn verify_nsec(query: &Query, soa_name: &Name, nsecs: &[&Record]) -> Proof {
+pub fn verify_nsec(query: Arc<Query>, soa_name: &Name, nsecs: &[&Record]) -> Proof {
     // TODO: consider converting this to Result, and giving explicit reason for the failure
 
     // first look for a record with the same name
